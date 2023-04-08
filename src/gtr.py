@@ -1,7 +1,3 @@
-''' TODO:
-        test functions
-        test functional_transforms
-'''
 import torch
 import torch_geometric
 from torch_geometric.transforms import BaseTransform
@@ -76,13 +72,13 @@ def compute_edges(
         # Add the edge {s,t} to the return array
         new_edges = torch.Tensor([[s, t], [t, s]]).long()
         gtr_edges = torch.cat([gtr_edges, new_edges], 1)
-        # Update the pseudoinverse with Woodburys formula
-        vec = pinv[:,s] - pinv[:,t]
+        # Update the pseudoinverse with Woodbury's formula
+        v = pinv[:,s] - pinv[:,t]
         effective_resistance = resistance_matrix[s,t]
-        pinv = pinv - (1/(1+effective_resistance))*torch.outer(vec, vec)
+        pinv = pinv - (1/(1+effective_resistance))*torch.outer(v, v)
         # Update the squared pseudoinverse with Woodbury's formula
         x = torch.zeros(data.num_nodes).to(device)
-        x[s] = 1; x[t] = -1
+        x[s], x[t] = 1, -1
         y = laplacian[:,s] - laplacian[:,t]
         U = torch.column_stack([x, y+x])
         V = torch.stack([y+x, x])
@@ -91,8 +87,8 @@ def compute_edges(
         right = V @ squared_pinv
         squared_pinv = squared_pinv - left@center@right
         # update the laplacian
-        laplacian[s,t] = -1; laplacian[t,s] = -1
-        laplacian[s,s] += 1; laplacian[t,t] += 1
+        laplacian[s,s] += 1; laplacian[s,t] -= 1
+        laplacian[t,s] -= 1; laplacian[t,t] += 1
     return gtr_edges
 
 
@@ -103,19 +99,19 @@ class AddGTREdges(BaseTransform):
         num_edges : int,
         try_gpu : bool = True
     ):
+        print(
+            "We do not recommend using AddGTREdges.",
+            "AddGTREdges computes additional edges each time a graph is loaded,",
+            "which is computationally expensive.",
+            "We recommend using PrecomputeGTREdges and AddPrecomputedGTREdges instead."
+        )
         self.num_edges = num_edges
-        self.try_gpu
+        self.try_gpu = try_gpu
 
     def __call__(
         self,
         data : torch_geometric.data.Data
     ) -> torch_geometric.data.Data:
-        print(
-            "We do not recommend using AddGTREdges.",
-            "add_gtr_edges computes additional edges each time a graph is loaded,",
-            "which is computationally expensive.",
-            "We recommend using precompute_gtr_edges and add_precomputed_gtr_edges instead."
-        )
         # add edge types
         if hasattr(data, "edge_type"):
             # if data already has edge types, label new edges with next unused int
@@ -132,7 +128,7 @@ class AddGTREdges(BaseTransform):
                 torch.ones(2*self.num_edges, dtype=torch.long)
             ])
         # add edges
-        new_edges = compute_edges(data, self.num_edges, self.try_gpus)
+        new_edges = compute_edges(data, self.num_edges, self.try_gpu)
         data.edge_index = torch.cat([data.edge_index, new_edges], dim=1)
         return data
 
@@ -150,7 +146,7 @@ class AddPrecomputedGTREdges(BaseTransform):
         data : torch_geometric.data.Data
     ) -> torch_geometric.data.Data:
         if not hasattr(data, "precomputed_gtr_edges"):
-            raise AttributeError("Data does not have precomputed edges. Edges must be computed with the transform PrecomputeGTREdges.")
+            raise AttributeError("Data does not have precomputed edges. Edges must be computed with the pre_transform PrecomputeGTREdges.")
         if data.precomputed_gtr_edges.shape[1] < 2*self.num_edges:
             raise ValueError("Too few edges have been precomputed.")
         # add edge types
@@ -189,15 +185,3 @@ class PrecomputeGTREdges(BaseTransform):
     ) -> torch_geometric.data.Data:
         data.precomputed_gtr_edges = compute_edges(data, self.num_edges, self.try_gpu)
         return data
-
-if __name__=="__main__":
-    from torch_geometric.datasets import TUDataset
-    import torch_geometric.transforms as T
-    pre_transform = T.Compose([PrecomputeGTREdges(20)])
-    transform = T.Compose([AddPrecomputedGTREdges(10)])
-    dataset_edges = TUDataset(
-        root="/tmp/",
-        name="MUTAG",
-        transform=transform,
-        pre_transform=pre_transform
-    )
