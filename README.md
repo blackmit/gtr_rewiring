@@ -4,7 +4,7 @@ A PyTorch Geometric implementation of the Greedy Total Resistance (GTR) rewiring
 
 ### Usage
 
-A Jupyter notebook with a simple example showing how to use the `gtr` module can be found [here](src/example.ipynb).
+A Jupyter notebook with a simple example of how to use the `gtr` module can be found [here](src/example.ipynb).
 
 ### Installation 
 The `gtr` module can be installed with pip using the following commands:
