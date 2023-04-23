@@ -6,90 +6,131 @@ from torch_geometric.data.datapipes import functional_transform
 import networkx as nx
 from functools import reduce
 
-def get_component_mask(
-    graph : nx.Graph
-) -> torch.Tensor:
-    """ Return a n x n torch tensor where the i,j entry is 1 iff i and j are in the same connected component of `graph` """
-    num_vertices = graph.number_of_nodes()
+class GTREdgeBuilder:
+    def __init__(
+        self,
+        data : torch_geometric.data.Data,
+        try_gpu : bool = True
+    ):
+        if try_gpu:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = torch.device('cpu')
+        self.data = data
+        self.graph = torch_geometric.utils.convert.to_networkx(data).to_undirected()
+        self.laplacian = torch.tensor(nx.laplacian_matrix(self.graph).todense().astype("float")).to(self.device)
+        self.pinv = torch.linalg.pinv(self.laplacian, hermitian=True)
+        self.squared_pinv = self.pinv @ self.pinv
+        self.edge_mask = self.compute_edge_mask()
+        self.component_mask = self.compute_component_mask().to(self.device)
 
-    def single_component_mask(
-        vertices_of_component : list
+    def compute_edge_mask(
+        self
     ) -> torch.Tensor:
-        """ Return a binary matrix where each i,j entry is 1 iff i and j are in `vertices_of_component` """
-        row_mask = torch.zeros((num_vertices, num_vertices))
-        col_mask = torch.zeros((num_vertices, num_vertices))
-        row_mask[vertices_of_component,:] = 1
-        col_mask[:,vertices_of_component] = 1
-        return torch.logical_and(row_mask, col_mask)
+        """ Return an n x n tensor where i,j entry is 1 iff {i,j} is not an edge in the graph or a self loop
 
-    component_mask = reduce(
-        torch.logical_or,
-        [single_component_mask(list(component)) for component in nx.connected_components(graph)]
-    )
-    return component_mask
+        The non-zero of the Laplacian are the entries i,j where i==j or {i,j} is an edge in the graph.
+        Thus, the logical_not of the laplacian is the edge mask.
+        """
+        return torch.logical_not(self.laplacian.bool())
 
 
-def compute_edges(
-    data : torch_geometric.data.Data,
-    num_edges : int,
-    try_gpu : bool = True
-) -> torch.Tensor:
-    """ Calculate edges to add to the graph using the GTR algorithm. """
-    # retrieve device used for matrix computations
-    if try_gpu:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    else:
-        device = torch.device('cpu')
-    # prepare the pseudoinverse and squared pseudoinverse
-    graph = torch_geometric.utils.convert.to_networkx(data).to_undirected()
-    laplacian = torch.tensor(nx.laplacian_matrix(graph).todense().astype("float")).to(device)
-    pinv = torch.linalg.pinv(laplacian, hermitian=True)
-    squared_pinv = pinv @ pinv
-    # get component mask
-    component_mask = get_component_mask(graph).to(device)
-    # Compute num_edges_to_add edges and append them to gtr_edges
-    gtr_edges = torch.zeros((2,0), dtype=torch.long)
-    for _ in range(num_edges):
-        # The entries resistance_matrix[s,t] and biharmonic_matrix[s,t]
-        # are the effective resistance and biharmonic distance between s and t.
-        pinv_diagonal = torch.diagonal(pinv)
-        resistance_matrix = pinv_diagonal.unsqueeze(0) + pinv_diagonal.unsqueeze(1) - 2*pinv
-        squared_pinv_diagonal = torch.diagonal(squared_pinv)
-        biharmonic_matrix = squared_pinv_diagonal.unsqueeze(0) + squared_pinv_diagonal.unsqueeze(1) - 2*squared_pinv
-        # diff_matrix[s,t] stores the change in total resistance when the edge {s,t} is added to the graph
-        diff_matrix = (biharmonic_matrix / (1 + resistance_matrix))
-        # We only want to add an edge not already in the graph and not between connected components.
-        # Multiplying by edge_mask sets the value of all self-loops
-        # and edges already in the graph to 0, as these entries
-        # are the only non-zero entries in the laplacian.
-        # Multiplying by component_mask sets the value
-        # of all edges between connected components to 0.
-        edge_mask = torch.logical_not(laplacian.bool())
-        masked_diff_matrix = diff_matrix * edge_mask * component_mask
-        # Find the endpoints of the edge that most decrease the total resistance.
-        # torch.argmax returns the index of max in flattened coordinates, hence the divmod.
-        s, t = divmod(torch.argmax(masked_diff_matrix).cpu().item(), data.num_nodes)
-        # Add the edge {s,t} to the return array
-        new_edges = torch.Tensor([[s, t], [t, s]]).long()
-        gtr_edges = torch.cat([gtr_edges, new_edges], 1)
-        # Update the pseudoinverse with Woodbury's formula
-        v = pinv[:,s] - pinv[:,t]
-        effective_resistance = resistance_matrix[s,t]
-        pinv = pinv - (1/(1+effective_resistance))*torch.outer(v, v)
-        # Update the squared pseudoinverse with Woodbury's formula
-        x = torch.zeros(data.num_nodes).to(device)
+    def compute_component_mask(
+        self
+    ) -> torch.Tensor:
+        """ Return a n x n torch tensor where the i,j entry is 1 iff i and j are in the same connected component of `graph` """
+        def single_component_mask(
+            vertices_of_component : list
+        ) -> torch.Tensor:
+            """ Return a binary matrix where each i,j entry is 1 iff i and j are in `vertices_of_component` """
+            row_mask = torch.zeros((self.data.num_nodes, self.data.num_nodes))
+            col_mask = torch.zeros((self.data.num_nodes, self.data.num_nodes))
+            row_mask[vertices_of_component,:] = 1
+            col_mask[:,vertices_of_component] = 1
+            return torch.logical_and(row_mask, col_mask)
+        component_mask = reduce(
+            torch.logical_or,
+            [single_component_mask(list(component)) for component in nx.connected_components(self.graph)]
+        )
+        return component_mask
+
+    def update_edge_mask(
+        self,
+        s : int,
+        t : int
+    ):
+        """ Update the edge mask after adding the edge {s,t} """
+        self.edge_mask[s,t] = 0
+        self.edge_mask[t,s] = 0
+
+    def update_laplacian(
+        self,
+        s : int,
+        t : int
+    ):
+        """ Update the Laplacian after adding the edge {s,t} """
+        self.laplacian[s,s] += 1; self.laplacian[s,t] -= 1
+        self.laplacian[t,s] -= 1; self.laplacian[t,t] += 1
+
+    def update_pseudoinvere(
+        self,
+        s : int,
+        t : int
+    ):
+        """ Update the pseudoinverse of the Laplacian with Woodbury's formula after adding the edge {s,t} """
+        v = self.pinv[:,s] - self.pinv[:,t]
+        effective_resistance = v[s] - v[t]
+        self.pinv = self.pinv - (1/(1+effective_resistance))*torch.outer(v, v)
+
+    def update_squared_pseudoinverse(
+        self,
+        s : int,
+        t : int
+    ):
+        """ Update the squared pseudoinverse of the Laplacian with Woodbury's formula after adding the edge {s,t} """
+        x = torch.zeros(self.data.num_nodes).to(self.device)
         x[s], x[t] = 1, -1
-        y = laplacian[:,s] - laplacian[:,t]
+        y = self.laplacian[:,s] - self.laplacian[:,t]
         U = torch.column_stack([x, y+x])
         V = torch.stack([y+x, x])
-        left = squared_pinv @ U
-        center = torch.inverse(torch.eye(2) + V@squared_pinv@U)
-        right = V @ squared_pinv
-        squared_pinv = squared_pinv - left@center@right
-        # update the laplacian
-        laplacian[s,s] += 1; laplacian[s,t] -= 1
-        laplacian[t,s] -= 1; laplacian[t,t] += 1
-    return gtr_edges
+        left = self.squared_pinv @ U
+        center = torch.inverse(torch.eye(2) + V@self.squared_pinv@U)
+        right = V @ self.squared_pinv
+        self.squared_pinv = self.squared_pinv - left@center@right
+
+    def compute_edges(
+        self,
+        num_edges : int,
+    ) -> torch.Tensor:
+        """ Calculate edges to add to the graph using the GTR heuristic. """
+        ret_edges = torch.zeros((2,0), dtype=torch.long)
+        for _ in range(num_edges):
+            # The entries resistance_matrix[s,t] and biharmonic_matrix[s,t]
+            # are the effective resistance and biharmonic distance between s and t.
+            pinv_diagonal = torch.diagonal(self.pinv)
+            resistance_matrix = pinv_diagonal.unsqueeze(0) + pinv_diagonal.unsqueeze(1) - 2*self.pinv
+            squared_pinv_diagonal = torch.diagonal(self.squared_pinv)
+            biharmonic_matrix = squared_pinv_diagonal.unsqueeze(0) + squared_pinv_diagonal.unsqueeze(1) - 2*self.squared_pinv
+            # diff_matrix[s,t] stores the change in total resistance when the edge {s,t} is added to the graph
+            diff_matrix = (biharmonic_matrix / (1 + resistance_matrix))
+            # We only want to add an edge not already in the graph and not between connected components.
+            # Multiplying by edge_mask sets the value of all self-loops
+            # and edges already in the graph to 0.
+            # Multiplying by component_mask sets the value
+            # of all edges between connected components to 0.
+            masked_diff_matrix = diff_matrix * self.edge_mask * self.component_mask
+            # Find the endpoints of the edge that most decrease the total resistance.
+            # torch.argmax returns the index of max in flattened coordinates, hence the divmod.
+            s, t = divmod(torch.argmax(masked_diff_matrix).cpu().item(), self.data.num_nodes)
+            # Add the edge {s,t} to the return array
+            new_edges = torch.Tensor([[s, t], [t, s]]).long()
+            ret_edges = torch.cat([ret_edges, new_edges], 1)
+            # Update the matrices for the next iteration
+            self.update_pseudoinvere(s, t)
+            self.update_squared_pseudoinverse(s, t)
+            self.update_laplacian(s, t)
+            self.update_edge_mask(s, t)
+        return ret_edges
 
 
 @functional_transform('add_gtr_edges')
@@ -128,13 +169,19 @@ class AddGTREdges(BaseTransform):
                 torch.ones(2*self.num_edges, dtype=torch.long)
             ])
         # add edges
-        new_edges = compute_edges(data, self.num_edges, self.try_gpu)
+        new_edges =  GTREdgeBuilder(data, self.try_gpu).compute_edges(self.num_edges)
         data.edge_index = torch.cat([data.edge_index, new_edges], dim=1)
         return data
 
 
 @functional_transform('add_precomputed_gtr_edges')
 class AddPrecomputedGTREdges(BaseTransform):
+    """ AddPrecomputedGTREdges adds a specified number of precomputed edges to a Data object.
+
+    The AddPrecomputedGTREdges transform adds a specified number of precomputed edges to a
+    torch_geometric.data.Data object. AddPrecomputedGTREdges must be used in conjuction with
+    the PrecomputeGTREdges.
+    """
     def __init__(
         self,
         num_edges : int
@@ -171,6 +218,13 @@ class AddPrecomputedGTREdges(BaseTransform):
 
 @functional_transform('precompute_gtr_edges')
 class PrecomputeGTREdges(BaseTransform):
+    """ PrecomputeGTREdges precomputes a specified number of edges with the GTR heuristic.
+
+    The PrecomputeGTREdges transform precomputes a specified number of edges to add with the GTR heuristic and stores
+    them as the attribute `precomputed_gtr_edges` in a torch_geometric Data object; however, PrecomputeGTREdges
+    does not actually add the edges to the graph. To do this, PrecomputeGTREdges must be used in conjuction with
+    the AddGTREdges transform.
+    """
     def __init__(
         self,
         num_edges : int,
@@ -183,5 +237,5 @@ class PrecomputeGTREdges(BaseTransform):
         self,
         data : torch_geometric.data.Data
     ) -> torch_geometric.data.Data:
-        data.precomputed_gtr_edges = compute_edges(data, self.num_edges, self.try_gpu)
+        data.precomputed_gtr_edges = GTREdgeBuilder(data, self.try_gpu).compute_edges(self.num_edges)
         return data
