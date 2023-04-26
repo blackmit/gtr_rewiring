@@ -94,7 +94,7 @@ class GTREdgeBuilder:
         U = torch.column_stack([x, y+x])
         V = torch.stack([y+x, x])
         left = self.squared_pinv @ U
-        center = torch.inverse(torch.eye(2) + V@self.squared_pinv@U)
+        center = torch.inverse(torch.eye(2).to(self.device) + V@self.squared_pinv@U)
         right = V @ self.squared_pinv
         self.squared_pinv = self.squared_pinv - left@center@right
 
