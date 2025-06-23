@@ -212,7 +212,7 @@ class AddPrecomputedGTREdges(BaseTransform):
                 torch.ones(2*self.num_edges, dtype=torch.long)
             ])
         # add new edges
-        new_edges = data.precomputed_gtr_edges[:,:2*self.num_edges]
+        new_edges = data.precomputed_gtr_edges[:,:2*self.num_edges].to(data.edge_index.device)
         data.edge_index = torch.cat([data.edge_index, new_edges], dim=1)
         return data
 
